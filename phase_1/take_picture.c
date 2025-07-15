@@ -1,35 +1,6 @@
 /**
- * This example takes a picture every 5s and print its size on serial monitor.
+ * This example takes a picture and sends it to EBAZ4205 via UART
  */
-
-// =============================== SETUP ======================================
-
-// 1. Board setup (Uncomment):
-// #define BOARD_WROVER_KIT
-// #define BOARD_ESP32CAM_AITHINKER
-// #define BOARD_ESP32S3_WROOM
-// #define BOARD_ESP32S3_GOOUUU
-
-/**
- * 2. Kconfig setup
- *
- * If you have a Kconfig file, copy the content from
- *  https://github.com/espressif/esp32-camera/blob/master/Kconfig into it.
- * In case you haven't, copy and paste this Kconfig file inside the src directory.
- * This Kconfig file has definitions that allows more control over the camera and
- * how it will be initialized.
- */
-
-/**
- * 3. Enable PSRAM on sdkconfig:
- *
- * CONFIG_ESP32_SPIRAM_SUPPORT=y
- *
- * More info on
- * https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/kconfig.html#config-esp32-spiram-support
- */
-
-// ================================ CODE ======================================
 
 #include <esp_log.h>
 #include <esp_system.h>
@@ -39,6 +10,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
 
 // support IDF 5.x
 #ifndef portTICK_RATE_MS
@@ -49,28 +22,17 @@
 
 #define BOARD_ESP32CAM_AITHINKER 1
 
-// WROVER-KIT PIN Map
-#ifdef BOARD_WROVER_KIT
+// UART Configuration for EBAZ4205 communication (avoid monitor conflict)
+#define UART_NUM UART_NUM_1
+#define UART_TX_PIN 12   // GPIO12 (safe pin)
+#define UART_RX_PIN 13   // GPIO13 (safe pin)
+#define UART_BAUD_RATE 921600  // High baud rate for image data
+#define UART_BUF_SIZE 2048
 
-#define CAM_PIN_PWDN -1  //power down is not used
-#define CAM_PIN_RESET -1 //software reset will be performed
-#define CAM_PIN_XCLK 21
-#define CAM_PIN_SIOD 26
-#define CAM_PIN_SIOC 27
-
-#define CAM_PIN_D7 35
-#define CAM_PIN_D6 34
-#define CAM_PIN_D5 39
-#define CAM_PIN_D4 36
-#define CAM_PIN_D3 19
-#define CAM_PIN_D2 18
-#define CAM_PIN_D1 5
-#define CAM_PIN_D0 4
-#define CAM_PIN_VSYNC 25
-#define CAM_PIN_HREF 23
-#define CAM_PIN_PCLK 22
-
-#endif
+// Image transmission protocol
+#define IMG_HEADER_START 0xAA55
+#define IMG_HEADER_END 0x55AA
+#define CHUNK_SIZE 1024  // Send image in chunks
 
 // ESP32Cam (AiThinker) PIN Map
 #ifdef BOARD_ESP32CAM_AITHINKER
@@ -94,45 +56,20 @@
 #define CAM_PIN_PCLK 22
 
 #endif
-// ESP32S3 (WROOM) PIN Map
-#ifdef BOARD_ESP32S3_WROOM
-#define CAM_PIN_PWDN 38
-#define CAM_PIN_RESET -1   //software reset will be performed
-#define CAM_PIN_VSYNC 6
-#define CAM_PIN_HREF 7
-#define CAM_PIN_PCLK 13
-#define CAM_PIN_XCLK 15
-#define CAM_PIN_SIOD 4
-#define CAM_PIN_SIOC 5
-#define CAM_PIN_D0 11
-#define CAM_PIN_D1 9
-#define CAM_PIN_D2 8
-#define CAM_PIN_D3 10
-#define CAM_PIN_D4 12
-#define CAM_PIN_D5 18
-#define CAM_PIN_D6 17
-#define CAM_PIN_D7 16
-#endif
-// ESP32S3 (GOOUU TECH)
-#ifdef BOARD_ESP32S3_GOOUUU
-#define CAM_PIN_PWDN -1
-#define CAM_PIN_RESET -1   //software reset will be performed
-#define CAM_PIN_VSYNC 6
-#define CAM_PIN_HREF 7
-#define CAM_PIN_PCLK 13
-#define CAM_PIN_XCLK 15
-#define CAM_PIN_SIOD 4
-#define CAM_PIN_SIOC 5
-#define CAM_PIN_D0 11
-#define CAM_PIN_D1 9
-#define CAM_PIN_D2 8
-#define CAM_PIN_D3 10
-#define CAM_PIN_D4 12
-#define CAM_PIN_D5 18
-#define CAM_PIN_D6 17
-#define CAM_PIN_D7 16
-#endif
-static const char *TAG = "example:take_picture";
+
+static const char *TAG = "camera_uart";
+
+// Image header structure
+typedef struct {
+    uint16_t start_marker;    // 0xAA55
+    uint16_t width;
+    uint16_t height;
+    uint32_t data_length;
+    uint16_t pixel_format;    // 0=RGB565, 1=JPEG, 2=GRAYSCALE
+    uint16_t image_id;        // Sequential image counter
+    uint32_t checksum;        // Simple checksum
+    uint16_t end_marker;      // 0x55AA
+} __attribute__((packed)) image_header_t;
 
 #if ESP_CAMERA_SUPPORTED
 static camera_config_t camera_config = {
@@ -154,87 +91,208 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
     .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_RGB565, //YUV422,GRAYSCALE,RGB565,JPEG
-    .frame_size = FRAMESIZE_240X240,    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
+    .pixel_format = PIXFORMAT_RGB565,
+    .frame_size = FRAMESIZE_96X96,    // Smaller size for faster transfer
 
-    .jpeg_quality = 12, //0-63, for OV series camera sensors, lower number means higher quality
-    .fb_count = 1,       //When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
+    .jpeg_quality = 12,
+    .fb_count = 1,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
 
 static esp_err_t init_camera(void)
 {
-    //initialize the camera
     esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK)
-    {
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera Init Failed");
         return err;
     }
-
+    ESP_LOGI(TAG, "Camera initialized successfully");
     return ESP_OK;
 }
 #endif
 
-static void print_rgb565_raw_data(camera_fb_t *fb)
+static esp_err_t init_uart(void)
 {
-    ESP_LOGI(TAG, "=== RGB565 RAW DATA START ===");
-    ESP_LOGI(TAG, "Width: %d", fb->width);
-    ESP_LOGI(TAG, "Height: %d", fb->height);
-    ESP_LOGI(TAG, "Format: RGB565");
-    ESP_LOGI(TAG, "Data Length: %zu bytes", fb->len);
-    ESP_LOGI(TAG, "Expected Length: %d bytes", fb->width * fb->height * 2);
-    
-    // Output as hex bytes (2 bytes per pixel for RGB565)
-    printf("DATA_START\n");
-    
-    for (size_t i = 0; i < fb->len; i += 16) {  // 16 bytes per line (8 pixels)
-        // Print hex values
-        for (size_t j = 0; j < 16 && (i + j) < fb->len; j++) {
-            printf("%02X", fb->buf[i + j]);
-            if (j % 2 == 1) printf(" ");  // Space after each pixel (2 bytes)
-        }
-        // printf("\n");
+    uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    // Install UART driver
+    esp_err_t err = uart_driver_install(UART_NUM, UART_BUF_SIZE, UART_BUF_SIZE, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver install failed");
+        return err;
     }
-    
-    printf("DATA_END\n");
-    ESP_LOGI(TAG, "=== RGB565 RAW DATA END ===");
+
+    // Configure UART parameters
+    err = uart_param_config(UART_NUM, &uart_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART param config failed");
+        return err;
+    }
+
+    // Set UART pins
+    err = uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART set pin failed");
+        return err;
+    }
+
+    ESP_LOGI(TAG, "UART initialized: TX=%d, RX=%d, Baud=%d", UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
+    return ESP_OK;
 }
 
+static uint32_t calculate_checksum(const uint8_t *data, size_t length)
+{
+    uint32_t checksum = 0;
+    for (size_t i = 0; i < length; i++) {
+        checksum += data[i];
+    }
+    return checksum;
+}
 
+static esp_err_t send_image_header(camera_fb_t *fb, uint16_t image_id)
+{
+    image_header_t header = {0};
+    
+    header.start_marker = IMG_HEADER_START;
+    header.width = fb->width;
+    header.height = fb->height;
+    header.data_length = fb->len;
+    header.pixel_format = (fb->format == PIXFORMAT_RGB565) ? 0 : 
+                         (fb->format == PIXFORMAT_JPEG) ? 1 : 2;
+    header.image_id = image_id;
+    header.checksum = calculate_checksum(fb->buf, fb->len);
+    header.end_marker = IMG_HEADER_END;
+    
+    ESP_LOGI(TAG, "Sending header: ID=%d, Size=%dx%d, Length=%lu, Format=%d", 
+             header.image_id, header.width, header.height, header.data_length, header.pixel_format);
+    
+    int bytes_sent = uart_write_bytes(UART_NUM, (const char*)&header, sizeof(header));
+    if (bytes_sent != sizeof(header)) {
+        ESP_LOGE(TAG, "Failed to send complete header");
+        return ESP_FAIL;
+    }
+    
+    return ESP_OK;
+}
+
+static esp_err_t send_image_data(camera_fb_t *fb)
+{
+    size_t total_sent = 0;
+    size_t remaining = fb->len;
+    
+    ESP_LOGI(TAG, "Sending image data: %zu bytes", fb->len);
+    
+    while (remaining > 0) {
+        size_t chunk_size = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
+        
+        int bytes_sent = uart_write_bytes(UART_NUM, (const char*)(fb->buf + total_sent), chunk_size);
+        if (bytes_sent < 0) {
+            ESP_LOGE(TAG, "UART write error");
+            return ESP_FAIL;
+        }
+        
+        total_sent += bytes_sent;
+        remaining -= bytes_sent;
+        
+        // Wait for UART buffer to clear
+        uart_wait_tx_done(UART_NUM, pdMS_TO_TICKS(50));
+        
+        // Progress indicator (less frequent)
+        if (total_sent % (CHUNK_SIZE * 5) == 0) {
+            ESP_LOGI(TAG, "Progress: %.1f%%", (float)total_sent * 100.0 / fb->len);
+        }
+    }
+    
+    ESP_LOGI(TAG, "Image data sent: %zu bytes", total_sent);
+    return ESP_OK;
+}
+
+static esp_err_t send_image_via_uart(camera_fb_t *fb, uint16_t image_id)
+{
+    esp_err_t err;
+    
+    // Send header first
+    err = send_image_header(fb, image_id);
+    if (err != ESP_OK) {
+        return err;
+    }
+    
+    // Small delay between header and data
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    // Send image data
+    err = send_image_data(fb);
+    if (err != ESP_OK) {
+        return err;
+    }
+    
+    // Send end marker
+    uint16_t end_marker = 0xDEAD;
+    uart_write_bytes(UART_NUM, (const char*)&end_marker, sizeof(end_marker));
+    uart_wait_tx_done(UART_NUM, pdMS_TO_TICKS(100));
+    
+    ESP_LOGI(TAG, "Image transmission completed");
+    return ESP_OK;
+}
 
 void app_main(void)
 {
 #if ESP_CAMERA_SUPPORTED
-    if(ESP_OK != init_camera()) {
+    // Initialize UART first
+    if (init_uart() != ESP_OK) {
+        ESP_LOGE(TAG, "UART initialization failed");
         return;
     }
-
-    while (1)
-    {
-        ESP_LOGI(TAG, "Taking picture...");
-        camera_fb_t *pic = esp_camera_fb_get();
-
-        if (pic) {
-            ESP_LOGI(TAG, "Picture taken! Size: %dx%d, %zu bytes", 
-                     pic->width, pic->height, pic->len);
-            print_rgb565_raw_data(pic);
-        }
-                    
-        // use pic->buf to access the image
-        ESP_LOGI(TAG, "Picture taken! Its size was: %zu bytes", pic->len);
-        esp_camera_fb_return(pic);
-
-        vTaskDelay(5000000 / portTICK_RATE_MS);
+    
+    // Initialize camera
+    if (init_camera() != ESP_OK) {
+        ESP_LOGE(TAG, "Camera initialization failed");
+        return;
     }
+    
+    ESP_LOGI(TAG, "System ready - Camera and UART initialized");
+    
+    uint16_t image_counter = 0;
+    
+    while (1) {
+        ESP_LOGI(TAG, "Taking picture #%d...", image_counter + 1);
+        camera_fb_t *pic = esp_camera_fb_get();
+        
+        if (pic) {
+            ESP_LOGI(TAG, "Picture captured: %dx%d, %zu bytes", 
+                     pic->width, pic->height, pic->len);
+            
+            // Send image via UART
+            esp_err_t err = send_image_via_uart(pic, image_counter);
+            if (err == ESP_OK) {
+                image_counter++;
+                ESP_LOGI(TAG, "Image #%d sent successfully", image_counter);
+            } else {
+                ESP_LOGE(TAG, "Failed to send image #%d", image_counter + 1);
+            }
+            
+            esp_camera_fb_return(pic);
+        } else {
+            ESP_LOGE(TAG, "Failed to capture image");
+        }
+        
+        // Wait before next capture
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    
 #else
     ESP_LOGE(TAG, "Camera support is not available for this chip");
-    return;
 #endif
 }
